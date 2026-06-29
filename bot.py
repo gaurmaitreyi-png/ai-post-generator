@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import asyncio
 import logging
 import tempfile
@@ -185,6 +186,137 @@ def post_to_reddit(title: str, text: str, image_bytes: io.BytesIO | None) -> str
         return None
 
 
+def post_to_instagram(caption: str, image_url: str | None) -> str | None:
+    ig_user_id = os.getenv("IG_USER_ID")
+    access_token = os.getenv("IG_ACCESS_TOKEN")
+    if not ig_user_id or not access_token:
+        logger.error("Instagram IG_USER_ID / IG_ACCESS_TOKEN not set.")
+        return None
+    if not image_url or not image_url.startswith("http"):
+        logger.error("Instagram requires a public image URL; none available for this article.")
+        return None
+    base = "https://graph.facebook.com/v21.0"
+    try:
+        # 1. Create a media container (Instagram fetches the image from image_url).
+        create = requests.post(
+            f"{base}/{ig_user_id}/media",
+            data={"image_url": image_url, "caption": caption[:2200], "access_token": access_token},
+            timeout=30,
+        ).json()
+        creation_id = create.get("id")
+        if not creation_id:
+            logger.error(f"Instagram container creation failed: {create}")
+            return None
+
+        # 2. Wait until the container finishes processing before publishing.
+        for _ in range(10):
+            status = requests.get(
+                f"{base}/{creation_id}",
+                params={"fields": "status_code", "access_token": access_token},
+                timeout=30,
+            ).json()
+            if status.get("status_code") == "FINISHED":
+                break
+            if status.get("status_code") == "ERROR":
+                logger.error(f"Instagram container processing error: {status}")
+                return None
+            time.sleep(2)
+
+        # 3. Publish the container.
+        publish = requests.post(
+            f"{base}/{ig_user_id}/media_publish",
+            data={"creation_id": creation_id, "access_token": access_token},
+            timeout=30,
+        ).json()
+        media_id = publish.get("id")
+        if not media_id:
+            logger.error(f"Instagram publish failed: {publish}")
+            return None
+
+        perma = requests.get(
+            f"{base}/{media_id}",
+            params={"fields": "permalink", "access_token": access_token},
+            timeout=30,
+        ).json()
+        return perma.get("permalink", f"https://www.instagram.com (id {media_id})")
+    except Exception as e:
+        logger.error(f"Instagram post failed: {e}")
+        return None
+
+
+def post_to_linkedin(text: str, image_bytes: io.BytesIO | None) -> str | None:
+    token = os.getenv("LINKEDIN_ACCESS_TOKEN")
+    person_urn = os.getenv("LINKEDIN_PERSON_URN")  # e.g. urn:li:person:xxxx
+    if not token or not person_urn:
+        logger.error("LinkedIn LINKEDIN_ACCESS_TOKEN / LINKEDIN_PERSON_URN not set.")
+        return None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json",
+    }
+    try:
+        asset_urn = None
+        if image_bytes:
+            # 1. Register an image upload to get an upload URL + asset URN.
+            reg = requests.post(
+                "https://api.linkedin.com/v2/assets?action=registerUpload",
+                headers=headers,
+                json={
+                    "registerUploadRequest": {
+                        "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+                        "owner": person_urn,
+                        "serviceRelationships": [
+                            {"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}
+                        ],
+                    }
+                },
+                timeout=30,
+            ).json()
+            try:
+                upload_url = reg["value"]["uploadMechanism"][
+                    "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"
+                ]["uploadUrl"]
+                asset_urn = reg["value"]["asset"]
+                # 2. Upload the raw image bytes to that URL.
+                image_bytes.seek(0)
+                up = requests.put(
+                    upload_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    data=image_bytes.read(),
+                    timeout=60,
+                )
+                if up.status_code not in (200, 201):
+                    logger.error(f"LinkedIn image upload failed: {up.status_code} {up.text}")
+                    asset_urn = None
+            except (KeyError, TypeError) as parse_err:
+                logger.error(f"LinkedIn registerUpload parse failed: {reg} ({parse_err})")
+                asset_urn = None
+
+        share_content = {
+            "shareCommentary": {"text": text[:3000]},
+            "shareMediaCategory": "IMAGE" if asset_urn else "NONE",
+        }
+        if asset_urn:
+            share_content["media"] = [{"status": "READY", "media": asset_urn}]
+
+        body = {
+            "author": person_urn,
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {"com.linkedin.ugc.ShareContent": share_content},
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+        }
+        res = requests.post("https://api.linkedin.com/v2/ugcPosts", headers=headers, json=body, timeout=30)
+        if res.status_code in (200, 201):
+            post_id = res.headers.get("x-restli-id") or res.json().get("id")
+            return f"https://www.linkedin.com/feed/update/{post_id}"
+        logger.error(f"LinkedIn post failed: {res.status_code} {res.text}")
+        return None
+    except Exception as e:
+        logger.error(f"LinkedIn post failed: {e}")
+        return None
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text.isdigit():
@@ -245,6 +377,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🐦 Post to Twitter", callback_data="twitter_yes"),
             InlineKeyboardButton("🤖 Post to Reddit", callback_data="reddit_yes"),
+        ],
+        [
+            InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes"),
+            InlineKeyboardButton("💼 Post to LinkedIn", callback_data="linkedin_yes"),
         ],
         [InlineKeyboardButton("❌ Skip", callback_data="twitter_no")],
     ]
@@ -311,6 +447,55 @@ async def handle_reddit_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+async def handle_instagram_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text("⏳ Posting to Instagram...")
+
+    ai_text = context.user_data.get('pending_post')
+    image_url = context.user_data.get('pending_image_url')
+
+    if not image_url:
+        await query.edit_message_text("❌ Instagram needs an image, but this article has none. Skipped.")
+        return
+
+    post_url = post_to_instagram(ai_text, image_url)
+
+    if post_url:
+        await query.edit_message_text(f"✅ Posted to Instagram!\n🔗 {post_url}")
+    else:
+        await query.edit_message_text(
+            "❌ Instagram post failed. Check that IG_USER_ID and IG_ACCESS_TOKEN are set in .env, "
+            "your account is a Business/Creator account linked to a Facebook Page, and the token is valid."
+        )
+
+
+async def handle_linkedin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text("⏳ Posting to LinkedIn...")
+
+    ai_text = context.user_data.get('pending_post')
+    image_url = context.user_data.get('pending_image_url')
+
+    # Re-download image for LinkedIn (it needs the raw bytes, not a URL).
+    image_bytes = None
+    if image_url:
+        image_bytes = download_image(image_url)
+
+    post_url = post_to_linkedin(ai_text, image_bytes)
+
+    if post_url:
+        await query.edit_message_text(f"✅ Posted to LinkedIn!\n🔗 {post_url}")
+    else:
+        await query.edit_message_text(
+            "❌ LinkedIn post failed. Check that LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN are set in "
+            ".env, the token has the w_member_social scope, and it hasn't expired."
+        )
+
+
 def build_app() -> Application:
     token = os.getenv("TELEGRAM_TOKEN")
     proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
@@ -339,6 +524,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_category, pattern="^cat_"))
     app.add_handler(CallbackQueryHandler(handle_twitter_confirm, pattern="^twitter_"))
     app.add_handler(CallbackQueryHandler(handle_reddit_confirm, pattern="^reddit_"))
+    app.add_handler(CallbackQueryHandler(handle_instagram_confirm, pattern="^instagram_"))
+    app.add_handler(CallbackQueryHandler(handle_linkedin_confirm, pattern="^linkedin_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
 
