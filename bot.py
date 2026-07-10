@@ -552,10 +552,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Gemini: generate post (with retry) ---
     post_prompt = (
-        f"Write a single, engaging news post of about 5-6 lines that clearly explains this story "
-        f"in nice, simple words. Write it as ONE flowing post — do NOT add platform labels or headings "
-        f"like 'LinkedIn:' or 'Twitter:', and do NOT split it into sections. End with a couple of "
-        f"relevant hashtags.\n\nHeadline: {title}\nDescription: {desc}"
+        f"Write ONE short news post of 4-5 lines as a single paragraph that clearly explains this story "
+        f"in simple, engaging words. Output ONLY the post text — no preamble like 'Here are the posts', "
+        f"no platform labels (LinkedIn/Twitter), no headings, no bullet points, no separators or asterisks. "
+        f"End with 2-3 relevant hashtags.\n\nHeadline: {title}\nDescription: {desc}"
     )
     ai_text = None
     for attempt in range(3):
@@ -597,8 +597,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['pending_article_url'] = None
     context.user_data['pending_image_urls'] = None
 
+    # --- Build the full article page now, so "Read full article" works + posting is instant later ---
+    prep_msg = await update.message.reply_text("🌐 Building the full article page...")
+    article_data = await publish_curated_article(context, wait=False)
+    read_more_row = []
+    if article_data:
+        read_more_row = [[InlineKeyboardButton("📖 Read full article", url=article_data["article_url"])]]
+        try:
+            await prep_msg.delete()
+        except Exception:
+            pass
+    else:
+        try:
+            await prep_msg.edit_text("⚠️ Couldn't build the article page now — you can still post below.")
+        except Exception:
+            pass
+
     # --- Ask for confirmation ---
-    keyboard = [
+    keyboard = read_more_row + [
         [InlineKeyboardButton("📢📸 Post to Channel + Instagram", callback_data="both_yes")],
         [InlineKeyboardButton("📢 Post to Agentic News channel", callback_data="channel_yes")],
         [
@@ -633,20 +649,60 @@ def get_curated_article(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
     return art
 
 
-async def ensure_article_published(context: ContextTypes.DEFAULT_TYPE, query) -> dict | None:
-    """Curate the story, publish its article page once (cached), and return the details.
+def update_index_page(headline: str, article_url: str) -> None:
+    """Maintain a homepage (index.html) listing recent articles — used as the Instagram bio link."""
+    token = os.getenv("GITHUB_TOKEN"); owner = os.getenv("GITHUB_OWNER"); repo = os.getenv("GITHUB_PAGES_REPO")
+    if not (token and owner and repo):
+        return
+    def esc(s): return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    api = f"https://api.github.com/repos/{owner}/{repo}/contents/index.html"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    try:
+        sha = None; items = ""
+        r = requests.get(api, headers=headers, timeout=30)
+        if r.status_code == 200:
+            j = r.json(); sha = j["sha"]
+            existing = base64.b64decode(j["content"]).decode("utf-8")
+            m = re.search(r"<!--LIST-->(.*?)<!--/LIST-->", existing, re.S)
+            items = m.group(1) if m else ""
+        date = datetime.now(timezone.utc).strftime("%b %d, %Y")
+        items = f'<li><a href="{esc(article_url)}">{esc(headline)}</a><span> · {date}</span></li>\n' + items
+        html = (
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<title>Agentic News</title><style>"
+            "body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#fafafa;color:#1a1a1a}"
+            ".bar{background:#0b3d91;color:#fff;padding:16px 20px;font-weight:700;font-size:22px}"
+            ".wrap{max-width:720px;margin:0 auto;padding:24px 20px 60px}"
+            "ul{list-style:none;padding:0}li{padding:16px 0;border-bottom:1px solid #ddd;font-size:18px}"
+            "a{color:#0b3d91;text-decoration:none;font-weight:600}span{color:#888;font-size:13px}"
+            "@media(prefers-color-scheme:dark){body{background:#121212;color:#e6e6e6}a{color:#7aa7ff}}"
+            "</style></head><body><div class=\"bar\">📰 AGENTIC NEWS</div><div class=\"wrap\">"
+            "<h2>Latest stories</h2><ul><!--LIST-->" + items + "<!--/LIST--></ul></div></body></html>"
+        )
+        body = {"message": "Update index", "content": base64.b64encode(html.encode("utf-8")).decode("ascii"), "branch": "main"}
+        if sha:
+            body["sha"] = sha
+        requests.put(api, headers=headers, json=body, timeout=30)
+    except Exception as e:
+        logger.error(f"Index update failed: {e}")
 
-    Returns {headline, caption, article_url, image_urls} or None (after showing an error)."""
+
+async def publish_curated_article(context: ContextTypes.DEFAULT_TYPE, wait: bool = True) -> dict | None:
+    """Curate the story, publish its article page once (cached), update the index, return details.
+
+    Returns {headline, caption, article_url, image_urls} or None on failure. No UI side effects."""
     art = get_curated_article(context)
     if not art:
-        await query.edit_message_text("❌ Couldn't write the article (Gemini busy). Try again in a moment.")
         return None
     headline = art["headline"].strip()
     caption = art.get("caption", "").strip()
 
-    # If we already published this story's page (e.g. posting to a second platform), reuse it.
+    # Already published this story's page (e.g. second platform, or done at preview time)? Reuse it.
     cached_url = context.user_data.get('pending_article_url')
     if cached_url:
+        if wait:
+            await wait_for_pages_live(cached_url)
         return {"headline": headline, "caption": caption, "article_url": cached_url,
                 "image_urls": context.user_data.get('pending_image_urls') or []}
 
@@ -658,23 +714,16 @@ async def ensure_article_published(context: ContextTypes.DEFAULT_TYPE, query) ->
     image_urls += get_extra_image_urls(headline, n=2)
     context.user_data['pending_image_urls'] = image_urls
 
-    # Build + publish the HTML page.
-    await query.edit_message_text("🌐 Publishing the article page...")
     html = build_article_html(headline, caption, art["article"].strip(), image_urls,
                               context.user_data.get('pending_source', 'News'),
                               context.user_data.get('pending_source_url'))
     article_url = publish_article_to_github(slugify(headline), html)
     if not article_url:
-        await query.edit_message_text(
-            "❌ Couldn't publish the article page. Check GITHUB_TOKEN / GITHUB_OWNER / GITHUB_PAGES_REPO "
-            "in .env and that the token has Contents write on the repo."
-        )
         return None
     context.user_data['pending_article_url'] = article_url
-
-    # Wait for GitHub Pages to build so the "Read more" link is live before we post.
-    await query.edit_message_text("⏳ Waiting for the article page to go live (up to ~2 min)...")
-    await wait_for_pages_live(article_url)
+    update_index_page(headline, article_url)  # keep the bio-link homepage current
+    if wait:
+        await wait_for_pages_live(article_url)
     return {"headline": headline, "caption": caption, "article_url": article_url, "image_urls": image_urls}
 
 
@@ -689,19 +738,19 @@ def _post_curated_to_instagram(data) -> str | None:
     img = data["image_urls"][0] if data["image_urls"] else None
     if not img:
         return None
-    # Instagram captions can't have tappable links, so the article URL goes in as plain text.
-    caption = f"📰 {data['headline']}\n\n{data['caption']}\n\n📖 Read the full story: {data['article_url']}"
+    # Instagram captions can't have tappable links, so we point readers to the bio link (the index page).
+    caption = f"📰 {data['headline']}\n\n{data['caption']}\n\n📖 Read the full story — link in bio 🔗"
     return post_to_instagram(caption, img)
 
 
 async def handle_channel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📝 Writing a curated headline and article...")
-    data = await ensure_article_published(context, query)
+    await query.edit_message_text("📢 Preparing and posting to Agentic News...")
+    data = await publish_curated_article(context)
     if not data:
+        await query.edit_message_text("❌ Couldn't prepare the article (Gemini or GitHub issue). Try again.")
         return
-    await query.edit_message_text("📢 Posting to Agentic News...")
     post_url = await _post_curated_to_channel(context, data)
     if post_url:
         await query.edit_message_text(f"✅ Posted to Agentic News!\n🔗 {post_url}\n📄 Article: {data['article_url']}")
@@ -715,9 +764,10 @@ async def handle_channel_confirm(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_both_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📝 Writing a curated headline and article...")
-    data = await ensure_article_published(context, query)
+    await query.edit_message_text("📝 Preparing the article...")
+    data = await publish_curated_article(context)
     if not data:
+        await query.edit_message_text("❌ Couldn't prepare the article (Gemini or GitHub issue). Try again.")
         return
 
     await query.edit_message_text("📢 Posting to your Telegram channel...")
@@ -794,9 +844,10 @@ async def handle_instagram_confirm(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("📝 Writing a curated post for Instagram...")
-    data = await ensure_article_published(context, query)
+    await query.edit_message_text("📝 Preparing the Instagram post...")
+    data = await publish_curated_article(context)
     if not data:
+        await query.edit_message_text("❌ Couldn't prepare the article (Gemini or GitHub issue). Try again.")
         return
     if not data["image_urls"]:
         await query.edit_message_text("❌ Instagram needs an image, but none is available. Skipped.")
