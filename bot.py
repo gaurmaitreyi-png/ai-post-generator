@@ -552,9 +552,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Gemini: generate post (with retry) ---
     post_prompt = (
-        f"Write an engaging social media post for LinkedIn and Twitter based on this "
-        f"headline: {title}. Description: {desc}. "
-        f"Include relevant hashtags and use simple formatting. Keep it under 270 characters for Twitter."
+        f"Write a single, engaging news post of about 5-6 lines that clearly explains this story "
+        f"in nice, simple words. Write it as ONE flowing post — do NOT add platform labels or headings "
+        f"like 'LinkedIn:' or 'Twitter:', and do NOT split it into sections. End with a couple of "
+        f"relevant hashtags.\n\nHeadline: {title}\nDescription: {desc}"
     )
     ai_text = None
     for attempt in range(3):
@@ -591,10 +592,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['pending_source'] = source
     context.user_data['pending_source_url'] = article.get("url")
     context.user_data['pending_image_url'] = article.get("urlToImage")
-    context.user_data['pending_article'] = None  # reset curated cache for this new story
+    # Reset per-story caches so a new pick doesn't reuse the previous article/page.
+    context.user_data['pending_article'] = None
+    context.user_data['pending_article_url'] = None
+    context.user_data['pending_image_urls'] = None
 
     # --- Ask for confirmation ---
     keyboard = [
+        [InlineKeyboardButton("📢📸 Post to Channel + Instagram", callback_data="both_yes")],
         [InlineKeyboardButton("📢 Post to Agentic News channel", callback_data="channel_yes")],
         [
             InlineKeyboardButton("🐦 Post to Twitter", callback_data="twitter_yes"),
@@ -628,59 +633,105 @@ def get_curated_article(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
     return art
 
 
-async def handle_channel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def ensure_article_published(context: ContextTypes.DEFAULT_TYPE, query) -> dict | None:
+    """Curate the story, publish its article page once (cached), and return the details.
 
-    source = context.user_data.get('pending_source', 'News')
-    source_url = context.user_data.get('pending_source_url')
-    main_image_url = context.user_data.get('pending_image_url')
-
-    # 1. Generate channel-specific headline + hook + full article (cached for reuse).
-    await query.edit_message_text("📝 Writing a curated headline and article...")
+    Returns {headline, caption, article_url, image_urls} or None (after showing an error)."""
     art = get_curated_article(context)
     if not art:
         await query.edit_message_text("❌ Couldn't write the article (Gemini busy). Try again in a moment.")
-        return
+        return None
     headline = art["headline"].strip()
     caption = art.get("caption", "").strip()
-    article_body = art["article"].strip()
 
-    # 2. Gather images: the article's own photo + a couple related ones from Pexels.
+    # If we already published this story's page (e.g. posting to a second platform), reuse it.
+    cached_url = context.user_data.get('pending_article_url')
+    if cached_url:
+        return {"headline": headline, "caption": caption, "article_url": cached_url,
+                "image_urls": context.user_data.get('pending_image_urls') or []}
+
+    # Gather images: the article's own photo + a couple related ones from Pexels.
     image_urls = []
+    main_image_url = context.user_data.get('pending_image_url')
     if main_image_url and main_image_url.startswith("http"):
         image_urls.append(main_image_url)
     image_urls += get_extra_image_urls(headline, n=2)
+    context.user_data['pending_image_urls'] = image_urls
 
-    # 3. Build the HTML page and publish it to GitHub Pages.
+    # Build + publish the HTML page.
     await query.edit_message_text("🌐 Publishing the article page...")
-    html = build_article_html(headline, caption, article_body, image_urls, source, source_url)
+    html = build_article_html(headline, caption, art["article"].strip(), image_urls,
+                              context.user_data.get('pending_source', 'News'),
+                              context.user_data.get('pending_source_url'))
     article_url = publish_article_to_github(slugify(headline), html)
     if not article_url:
         await query.edit_message_text(
             "❌ Couldn't publish the article page. Check GITHUB_TOKEN / GITHUB_OWNER / GITHUB_PAGES_REPO "
             "in .env and that the token has Contents write on the repo."
         )
-        return
+        return None
+    context.user_data['pending_article_url'] = article_url
 
-    # 4. Wait for GitHub Pages to build so the "Read more" link is live before we post.
+    # Wait for GitHub Pages to build so the "Read more" link is live before we post.
     await query.edit_message_text("⏳ Waiting for the article page to go live (up to ~2 min)...")
     await wait_for_pages_live(article_url)
+    return {"headline": headline, "caption": caption, "article_url": article_url, "image_urls": image_urls}
 
-    # 5. Post to the channel: photo + headline/hook + a "Read more" button.
+
+async def _post_curated_to_channel(context, data) -> str | None:
+    image_bytes = download_image(data["image_urls"][0]) if data["image_urls"] else None
+    cap = f"📰 {data['headline']}\n\n{data['caption']}" if data["caption"] else f"📰 {data['headline']}"
+    read_more = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Read the full story", url=data["article_url"])]])
+    return await post_to_telegram_channel(context.bot, cap, image_bytes, reply_markup=read_more)
+
+
+def _post_curated_to_instagram(data) -> str | None:
+    img = data["image_urls"][0] if data["image_urls"] else None
+    if not img:
+        return None
+    # Instagram captions can't have tappable links, so the article URL goes in as plain text.
+    caption = f"📰 {data['headline']}\n\n{data['caption']}\n\n📖 Read the full story: {data['article_url']}"
+    return post_to_instagram(caption, img)
+
+
+async def handle_channel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📝 Writing a curated headline and article...")
+    data = await ensure_article_published(context, query)
+    if not data:
+        return
     await query.edit_message_text("📢 Posting to Agentic News...")
-    image_bytes = download_image(image_urls[0]) if image_urls else None
-    channel_caption = f"📰 {headline}\n\n{caption}" if caption else f"📰 {headline}"
-    read_more = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Read the full story", url=article_url)]])
-    post_url = await post_to_telegram_channel(context.bot, channel_caption, image_bytes, reply_markup=read_more)
-
+    post_url = await _post_curated_to_channel(context, data)
     if post_url:
-        await query.edit_message_text(f"✅ Posted to Agentic News!\n🔗 {post_url}\n📄 Article: {article_url}")
+        await query.edit_message_text(f"✅ Posted to Agentic News!\n🔗 {post_url}\n📄 Article: {data['article_url']}")
     else:
         await query.edit_message_text(
-            "❌ Channel post failed. The article page was published at:\n" + article_url +
+            "❌ Channel post failed. The article page was published at:\n" + data["article_url"] +
             "\nMake sure the bot is an admin of the channel with 'Post Messages' enabled."
         )
+
+
+async def handle_both_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📝 Writing a curated headline and article...")
+    data = await ensure_article_published(context, query)
+    if not data:
+        return
+
+    await query.edit_message_text("📢 Posting to your Telegram channel...")
+    channel_ok = await _post_curated_to_channel(context, data)
+
+    await query.edit_message_text("📸 Posting to Instagram...")
+    insta_ok = _post_curated_to_instagram(data)
+
+    lines = [
+        ("✅" if channel_ok else "❌") + " Telegram channel",
+        ("✅" if insta_ok else "❌") + " Instagram",
+        f"\n📄 Article: {data['article_url']}",
+    ]
+    await query.edit_message_text("Done posting:\n" + "\n".join(lines))
 
 
 async def handle_twitter_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -743,28 +794,25 @@ async def handle_instagram_confirm(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    image_url = context.user_data.get('pending_image_url')
-    if not image_url:
-        await query.edit_message_text("❌ Instagram needs an image, but this article has none. Skipped.")
+    await query.edit_message_text("📝 Writing a curated post for Instagram...")
+    data = await ensure_article_published(context, query)
+    if not data:
+        return
+    if not data["image_urls"]:
+        await query.edit_message_text("❌ Instagram needs an image, but none is available. Skipped.")
         return
 
-    # Use the curated headline + hook as the caption (same voice as the channel).
-    await query.edit_message_text("📝 Writing a curated caption for Instagram...")
-    art = get_curated_article(context)
-    if art:
-        caption = f"📰 {art['headline']}\n\n{art.get('caption', '')}".strip()
-    else:
-        caption = context.user_data.get('pending_post') or context.user_data.get('pending_title', '')
-
     await query.edit_message_text("⏳ Posting to Instagram...")
-    post_url = post_to_instagram(caption, image_url)
+    post_url = _post_curated_to_instagram(data)
 
     if post_url:
-        await query.edit_message_text(f"✅ Posted to Instagram!\n🔗 {post_url}")
+        await query.edit_message_text(
+            f"✅ Posted to Instagram!\n🔗 {post_url}\n📄 Article: {data['article_url']}"
+        )
     else:
         await query.edit_message_text(
             "❌ Instagram post failed. Check that IG_USER_ID and IG_ACCESS_TOKEN are set in .env, "
-            "your account is a Business/Creator account linked to a Facebook Page, and the token is valid."
+            "your account is a Business account linked to a Facebook Page, and the token is valid."
         )
 
 
@@ -819,6 +867,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_category, pattern="^cat_"))
+    app.add_handler(CallbackQueryHandler(handle_both_confirm, pattern="^both_"))
     app.add_handler(CallbackQueryHandler(handle_channel_confirm, pattern="^channel_"))
     app.add_handler(CallbackQueryHandler(handle_twitter_confirm, pattern="^twitter_"))
     app.add_handler(CallbackQueryHandler(handle_reddit_confirm, pattern="^reddit_"))
