@@ -1,9 +1,14 @@
 import os
 import io
+import sys
+import re
+import json
 import time
+import base64
 import asyncio
 import logging
 import tempfile
+from datetime import datetime, timezone
 import requests
 import tweepy
 import praw
@@ -15,11 +20,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Windows consoles default to cp1252, which crashes on emoji in print()/logging output.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 CATEGORIES = ['Tech', 'Business', 'Science', 'Entertainment', 'Sports']
+# Map our display names to NewsAPI's exact category slugs (NewsAPI uses "technology", not "tech").
+NEWS_CATEGORY_MAP = {'tech': 'technology'}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -55,13 +69,30 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     category = query.data.split('_')[1]
+    news_category = NEWS_CATEGORY_MAP.get(category, category)
     await query.edit_message_text(text=f"🔍 Fetching latest live {category} news...")
-    news_url = f"https://newsapi.org/v2/top-headlines?category={category}&language=en&pageSize=5&apiKey={os.getenv('NEWS_API_KEY')}"
+    key = os.getenv('NEWS_API_KEY')
     try:
-        res = requests.get(news_url, timeout=10).json()
+        res = requests.get(
+            "https://newsapi.org/v2/top-headlines",
+            params={"category": news_category, "country": "us", "pageSize": 5, "apiKey": key},
+            timeout=10,
+        ).json()
+        if res.get("status") == "error":
+            logger.error(f"NewsAPI error: {res.get('message')}")
+            await query.edit_message_text(f"❌ News service error: {res.get('message', 'please try again later')}")
+            return
         articles = res.get('articles', [])
         if not articles:
-            await query.edit_message_text(f"❌ No news found for {category}.")
+            # Fallback: broader search via the /everything endpoint.
+            res2 = requests.get(
+                "https://newsapi.org/v2/everything",
+                params={"q": news_category, "language": "en", "sortBy": "publishedAt", "pageSize": 5, "apiKey": key},
+                timeout=10,
+            ).json()
+            articles = res2.get('articles', [])
+        if not articles:
+            await query.edit_message_text(f"❌ No news found for {category} right now. Try another category.")
             return
         context.user_data['articles'] = articles
         news_list = f"📰 Top {category.capitalize()} News\n\n"
@@ -317,6 +348,192 @@ def post_to_linkedin(text: str, image_bytes: io.BytesIO | None) -> str | None:
         return None
 
 
+async def post_to_telegram_channel(bot, text: str, image_bytes: io.BytesIO | None, reply_markup=None) -> str | None:
+    channel_id = os.getenv("TELEGRAM_CHANNEL_ID")
+    if not channel_id:
+        logger.error("TELEGRAM_CHANNEL_ID not set in .env.")
+        return None
+    try:
+        if image_bytes:
+            image_bytes.seek(0)
+            # Telegram photo captions max out at 1024 chars.
+            msg = await bot.send_photo(chat_id=channel_id, photo=image_bytes, caption=text[:1024],
+                                       reply_markup=reply_markup, write_timeout=60)
+        else:
+            msg = await bot.send_message(chat_id=channel_id, text=text[:4096], reply_markup=reply_markup)
+        username = getattr(msg.chat, "username", None)
+        if username:
+            return f"https://t.me/{username}/{msg.message_id}"
+        internal = str(msg.chat.id).replace("-100", "", 1)
+        return f"https://t.me/c/{internal}/{msg.message_id}"
+    except Exception as e:
+        logger.error(f"Telegram channel post failed: {e}")
+        return None
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "news").lower()).strip("-")
+    return (slug[:60] or "news")
+
+
+def generate_channel_article(title: str, desc: str, source: str) -> dict | None:
+    """Ask Gemini for channel-specific headline, hook caption, and a full article body."""
+    prompt = (
+        "You are the editor of a news channel called 'Agentic News'. "
+        "Using ONLY the information in the headline and description below, produce JSON with keys "
+        "'headline', 'caption', and 'article'.\n"
+        "- headline: an eye-catching but accurate, informative headline (max ~90 characters). No clickbait falsehoods.\n"
+        "- caption: 1-2 punchy sentences to hook a reader on Telegram, followed by 2-3 relevant hashtags.\n"
+        "- article: a neutral, well-structured news article of 4-6 paragraphs. Do NOT invent specific "
+        "quotes, numbers, names, or events that are not implied by the given information.\n"
+        "Return ONLY raw JSON, no markdown fences.\n\n"
+        f"Headline: {title}\nDescription: {desc}\nSource: {source}"
+    )
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            raw = (resp.text or "").strip()
+            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+            data = json.loads(raw)
+            if data.get("headline") and data.get("article"):
+                return data
+        except Exception as e:
+            logger.error(f"Article generation attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+    return None
+
+
+def get_extra_image_urls(query: str, n: int = 2) -> list[str]:
+    """Fetch a few extra related photos from Pexels for the article body."""
+    key = os.getenv("PEXELS_API_KEY")
+    if not key:
+        return []
+    try:
+        res = requests.get(
+            "https://api.pexels.com/v1/search",
+            headers={"Authorization": key},
+            params={"query": query, "per_page": n, "orientation": "landscape"},
+            timeout=15,
+        ).json()
+        return [p["src"]["large"] for p in res.get("photos", []) if p.get("src", {}).get("large")]
+    except Exception as e:
+        logger.error(f"Pexels fetch failed: {e}")
+        return []
+
+
+def build_article_html(headline: str, caption: str, article: str, image_urls: list[str],
+                       source: str, source_url: str | None) -> str:
+    """Render a clean, news-style standalone HTML page for GitHub Pages."""
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", article) if p.strip()]
+    date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Interleave the extra images between paragraphs.
+    body_parts = []
+    extra_imgs = image_urls[1:] if len(image_urls) > 1 else []
+    for i, para in enumerate(paragraphs):
+        body_parts.append(f"<p>{esc(para)}</p>")
+        if extra_imgs and i == max(1, len(paragraphs) // 2):
+            body_parts.append(f'<figure><img src="{esc(extra_imgs[0])}" alt=""></figure>')
+        if len(extra_imgs) > 1 and i == len(paragraphs) - 1:
+            body_parts.append(f'<figure><img src="{esc(extra_imgs[1])}" alt=""></figure>')
+    body_html = "\n".join(body_parts)
+
+    hero = f'<figure class="hero"><img src="{esc(image_urls[0])}" alt=""></figure>' if image_urls else ""
+    source_line = f'<a href="{esc(source_url)}" target="_blank" rel="noopener">{esc(source)}</a>' if source_url else esc(source)
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(headline)} — Agentic News</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; font-family: Georgia, 'Times New Roman', serif; line-height:1.7;
+         color:#1a1a1a; background:#fafafa; }}
+  .bar {{ background:#0b3d91; color:#fff; padding:14px 20px; font-family:Arial,Helvetica,sans-serif;
+          font-weight:700; letter-spacing:.5px; font-size:20px; }}
+  .wrap {{ max-width:760px; margin:0 auto; padding:24px 20px 60px; }}
+  h1 {{ font-size:34px; line-height:1.25; margin:18px 0 8px; }}
+  .meta {{ font-family:Arial,Helvetica,sans-serif; color:#666; font-size:14px; margin-bottom:20px; }}
+  .lead {{ font-size:20px; color:#333; font-style:italic; margin:0 0 24px; }}
+  figure {{ margin:24px 0; }}
+  figure img {{ width:100%; height:auto; border-radius:8px; display:block; }}
+  figure.hero img {{ border-radius:10px; }}
+  p {{ font-size:19px; margin:0 0 20px; }}
+  .foot {{ font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#888; border-top:1px solid #ddd;
+           margin-top:40px; padding-top:16px; }}
+  a {{ color:#0b3d91; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ background:#121212; color:#e6e6e6; }}
+    .lead {{ color:#c8c8c8; }} .meta,.foot {{ color:#9a9a9a; }} a {{ color:#7aa7ff; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="bar">📰 AGENTIC NEWS</div>
+  <div class="wrap">
+    <h1>{esc(headline)}</h1>
+    <div class="meta">{date_str} · Source: {source_line}</div>
+    <p class="lead">{esc(caption)}</p>
+    {hero}
+    {body_html}
+    <div class="foot">
+      This article was auto-generated by Agentic News from public reporting. For the original report, see {source_line}.
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def publish_article_to_github(slug: str, html: str) -> str | None:
+    """Publish the HTML article to the GitHub Pages repo via the Contents API."""
+    token = os.getenv("GITHUB_TOKEN")
+    owner = os.getenv("GITHUB_OWNER")
+    repo = os.getenv("GITHUB_PAGES_REPO")
+    if not (token and owner and repo):
+        logger.error("GITHUB_TOKEN / GITHUB_OWNER / GITHUB_PAGES_REPO not set in .env.")
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = f"articles/{stamp}-{slug}.html"
+    try:
+        res = requests.put(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json={
+                "message": f"Publish article: {slug}",
+                "content": base64.b64encode(html.encode("utf-8")).decode("ascii"),
+                "branch": "main",
+            },
+            timeout=30,
+        )
+        if res.status_code in (200, 201):
+            return f"https://{owner}.github.io/{repo}/{path}"
+        logger.error(f"GitHub publish failed: {res.status_code} {res.text}")
+        return None
+    except Exception as e:
+        logger.error(f"GitHub publish failed: {e}")
+        return None
+
+
+async def wait_for_pages_live(url: str, timeout: int = 120, interval: int = 6) -> bool:
+    """Poll a GitHub Pages URL until it returns 200 (Pages rebuilds take ~1-2 min)."""
+    elapsed = 0
+    while elapsed < timeout:
+        try:
+            if requests.head(url, timeout=10, allow_redirects=True).status_code == 200:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+        elapsed += interval
+    return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text.isdigit():
@@ -370,10 +587,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Save to user_data for the confirm step ---
     context.user_data['pending_post'] = ai_text
     context.user_data['pending_title'] = title
+    context.user_data['pending_desc'] = desc
+    context.user_data['pending_source'] = source
+    context.user_data['pending_source_url'] = article.get("url")
     context.user_data['pending_image_url'] = article.get("urlToImage")
+    context.user_data['pending_article'] = None  # reset curated cache for this new story
 
     # --- Ask for confirmation ---
     keyboard = [
+        [InlineKeyboardButton("📢 Post to Agentic News channel", callback_data="channel_yes")],
         [
             InlineKeyboardButton("🐦 Post to Twitter", callback_data="twitter_yes"),
             InlineKeyboardButton("🤖 Post to Reddit", callback_data="reddit_yes"),
@@ -389,6 +611,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📢 Where should I post this?",
         reply_markup=reply_markup
     )
+
+
+def get_curated_article(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    """Generate the curated headline/hook/article once, then cache it for reuse across platforms."""
+    art = context.user_data.get('pending_article')
+    if art:
+        return art
+    art = generate_channel_article(
+        context.user_data.get('pending_title', 'Latest News'),
+        context.user_data.get('pending_desc', ''),
+        context.user_data.get('pending_source', 'News'),
+    )
+    if art:
+        context.user_data['pending_article'] = art
+    return art
+
+
+async def handle_channel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    source = context.user_data.get('pending_source', 'News')
+    source_url = context.user_data.get('pending_source_url')
+    main_image_url = context.user_data.get('pending_image_url')
+
+    # 1. Generate channel-specific headline + hook + full article (cached for reuse).
+    await query.edit_message_text("📝 Writing a curated headline and article...")
+    art = get_curated_article(context)
+    if not art:
+        await query.edit_message_text("❌ Couldn't write the article (Gemini busy). Try again in a moment.")
+        return
+    headline = art["headline"].strip()
+    caption = art.get("caption", "").strip()
+    article_body = art["article"].strip()
+
+    # 2. Gather images: the article's own photo + a couple related ones from Pexels.
+    image_urls = []
+    if main_image_url and main_image_url.startswith("http"):
+        image_urls.append(main_image_url)
+    image_urls += get_extra_image_urls(headline, n=2)
+
+    # 3. Build the HTML page and publish it to GitHub Pages.
+    await query.edit_message_text("🌐 Publishing the article page...")
+    html = build_article_html(headline, caption, article_body, image_urls, source, source_url)
+    article_url = publish_article_to_github(slugify(headline), html)
+    if not article_url:
+        await query.edit_message_text(
+            "❌ Couldn't publish the article page. Check GITHUB_TOKEN / GITHUB_OWNER / GITHUB_PAGES_REPO "
+            "in .env and that the token has Contents write on the repo."
+        )
+        return
+
+    # 4. Wait for GitHub Pages to build so the "Read more" link is live before we post.
+    await query.edit_message_text("⏳ Waiting for the article page to go live (up to ~2 min)...")
+    await wait_for_pages_live(article_url)
+
+    # 5. Post to the channel: photo + headline/hook + a "Read more" button.
+    await query.edit_message_text("📢 Posting to Agentic News...")
+    image_bytes = download_image(image_urls[0]) if image_urls else None
+    channel_caption = f"📰 {headline}\n\n{caption}" if caption else f"📰 {headline}"
+    read_more = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Read the full story", url=article_url)]])
+    post_url = await post_to_telegram_channel(context.bot, channel_caption, image_bytes, reply_markup=read_more)
+
+    if post_url:
+        await query.edit_message_text(f"✅ Posted to Agentic News!\n🔗 {post_url}\n📄 Article: {article_url}")
+    else:
+        await query.edit_message_text(
+            "❌ Channel post failed. The article page was published at:\n" + article_url +
+            "\nMake sure the bot is an admin of the channel with 'Post Messages' enabled."
+        )
 
 
 async def handle_twitter_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,16 +743,21 @@ async def handle_instagram_confirm(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("⏳ Posting to Instagram...")
-
-    ai_text = context.user_data.get('pending_post')
     image_url = context.user_data.get('pending_image_url')
-
     if not image_url:
         await query.edit_message_text("❌ Instagram needs an image, but this article has none. Skipped.")
         return
 
-    post_url = post_to_instagram(ai_text, image_url)
+    # Use the curated headline + hook as the caption (same voice as the channel).
+    await query.edit_message_text("📝 Writing a curated caption for Instagram...")
+    art = get_curated_article(context)
+    if art:
+        caption = f"📰 {art['headline']}\n\n{art.get('caption', '')}".strip()
+    else:
+        caption = context.user_data.get('pending_post') or context.user_data.get('pending_title', '')
+
+    await query.edit_message_text("⏳ Posting to Instagram...")
+    post_url = post_to_instagram(caption, image_url)
 
     if post_url:
         await query.edit_message_text(f"✅ Posted to Instagram!\n🔗 {post_url}")
@@ -522,6 +819,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_category, pattern="^cat_"))
+    app.add_handler(CallbackQueryHandler(handle_channel_confirm, pattern="^channel_"))
     app.add_handler(CallbackQueryHandler(handle_twitter_confirm, pattern="^twitter_"))
     app.add_handler(CallbackQueryHandler(handle_reddit_confirm, pattern="^reddit_"))
     app.add_handler(CallbackQueryHandler(handle_instagram_confirm, pattern="^instagram_"))
