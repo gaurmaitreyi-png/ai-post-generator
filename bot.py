@@ -617,15 +617,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = read_more_row + [
         [InlineKeyboardButton("📢📸 Post to Channel + Instagram", callback_data="both_yes")],
         [InlineKeyboardButton("📢 Post to Agentic News channel", callback_data="channel_yes")],
-        [
-            InlineKeyboardButton("🐦 Post to Twitter", callback_data="twitter_yes"),
-            InlineKeyboardButton("🤖 Post to Reddit", callback_data="reddit_yes"),
-        ],
-        [
-            InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes"),
-            InlineKeyboardButton("💼 Post to LinkedIn", callback_data="linkedin_yes"),
-        ],
-        [InlineKeyboardButton("❌ Skip", callback_data="twitter_no")],
+        [InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes")],
+        [InlineKeyboardButton("❌ Skip", callback_data="skip")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -892,6 +885,12 @@ async def handle_linkedin_confirm(update: Update, context: ContextTypes.DEFAULT_
         )
 
 
+async def handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❌ Skipped — nothing was posted.")
+
+
 def build_app() -> Application:
     token = os.getenv("TELEGRAM_TOKEN")
     proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
@@ -920,10 +919,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_category, pattern="^cat_"))
     app.add_handler(CallbackQueryHandler(handle_both_confirm, pattern="^both_"))
     app.add_handler(CallbackQueryHandler(handle_channel_confirm, pattern="^channel_"))
-    app.add_handler(CallbackQueryHandler(handle_twitter_confirm, pattern="^twitter_"))
-    app.add_handler(CallbackQueryHandler(handle_reddit_confirm, pattern="^reddit_"))
     app.add_handler(CallbackQueryHandler(handle_instagram_confirm, pattern="^instagram_"))
-    app.add_handler(CallbackQueryHandler(handle_linkedin_confirm, pattern="^linkedin_"))
+    app.add_handler(CallbackQueryHandler(handle_skip, pattern="^skip$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
 
