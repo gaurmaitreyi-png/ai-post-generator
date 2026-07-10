@@ -34,6 +34,9 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 CATEGORIES = ['Tech', 'Business', 'Science', 'Entertainment', 'Sports']
 # Map our display names to NewsAPI's exact category slugs (NewsAPI uses "technology", not "tech").
 NEWS_CATEGORY_MAP = {'tech': 'technology'}
+# Stable fallback images so every post ALWAYS has a valid image (Instagram is strict about this).
+DEFAULT_IMAGE_URL = "https://images.pexels.com/photos/60133/pexels-photo-60133.jpeg?auto=compress&cs=tinysrgb&w=1200&h=650"
+DEFAULT_IG_SQUARE = "https://images.pexels.com/photos/60133/pexels-photo-60133.jpeg?auto=compress&cs=tinysrgb&fit=crop&w=1080&h=1080"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -421,6 +424,30 @@ def get_extra_image_urls(query: str, n: int = 2) -> list[str]:
         return []
 
 
+def to_instagram_square(url: str) -> str | None:
+    """Turn a Pexels image URL into a 1080x1080 square crop — always a valid Instagram aspect ratio."""
+    if url and "images.pexels.com" in url:
+        return url.split("?")[0] + "?auto=compress&cs=tinysrgb&fit=crop&w=1080&h=1080"
+    return None
+
+
+def get_instagram_image_url(image_urls: list[str], query: str) -> str:
+    """Always return an Instagram-safe image URL (valid aspect ratio), never None."""
+    # 1. Square-crop a Pexels image we already gathered for this story.
+    for u in image_urls:
+        sq = to_instagram_square(u)
+        if sq:
+            return sq
+    # 2. Fetch a fresh Pexels image, then square-crop it.
+    for q in (query, "breaking news"):
+        for u in get_extra_image_urls(q, 1):
+            sq = to_instagram_square(u)
+            if sq:
+                return sq
+    # 3. Guaranteed fallback so Instagram never fails for lack of a valid image.
+    return DEFAULT_IG_SQUARE
+
+
 def build_article_html(headline: str, caption: str, article: str, image_urls: list[str],
                        source: str, source_url: str | None) -> str:
     """Render a clean, news-style standalone HTML page for GitHub Pages."""
@@ -705,6 +732,8 @@ async def publish_curated_article(context: ContextTypes.DEFAULT_TYPE, wait: bool
     if main_image_url and main_image_url.startswith("http"):
         image_urls.append(main_image_url)
     image_urls += get_extra_image_urls(headline, n=2)
+    if not image_urls:  # never leave a story without an image
+        image_urls = get_extra_image_urls("breaking news", n=1) or [DEFAULT_IMAGE_URL]
     context.user_data['pending_image_urls'] = image_urls
 
     html = build_article_html(headline, caption, art["article"].strip(), image_urls,
@@ -728,9 +757,8 @@ async def _post_curated_to_channel(context, data) -> str | None:
 
 
 def _post_curated_to_instagram(data) -> str | None:
-    img = data["image_urls"][0] if data["image_urls"] else None
-    if not img:
-        return None
+    # Always use an Instagram-safe (valid aspect ratio) image so it never gets rejected.
+    img = get_instagram_image_url(data["image_urls"], data["headline"])
     # Instagram captions can't have tappable links, so we point readers to the bio link (the index page).
     caption = f"📰 {data['headline']}\n\n{data['caption']}\n\n📖 Read the full story — link in bio 🔗"
     return post_to_instagram(caption, img)
@@ -841,9 +869,6 @@ async def handle_instagram_confirm(update: Update, context: ContextTypes.DEFAULT
     data = await publish_curated_article(context)
     if not data:
         await query.edit_message_text("❌ Couldn't prepare the article (Gemini or GitHub issue). Try again.")
-        return
-    if not data["image_urls"]:
-        await query.edit_message_text("❌ Instagram needs an image, but none is available. Skipped.")
         return
 
     await query.edit_message_text("⏳ Posting to Instagram...")
