@@ -19,6 +19,7 @@ from google import genai
 from dotenv import load_dotenv
 
 from ml.classifier import check_headline  # fine-tuned DistilBERT clickbait detector
+from agent import run_agent               # conversational agent (LLM tool-calling loop)
 
 load_dotenv()
 
@@ -67,7 +68,15 @@ def get_twitter_v1_api():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat_{cat.lower()}")] for cat in CATEGORIES]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("👋 Welcome! Choose a category to see live breaking headlines:", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "👋 Welcome to Agentic News!\n\n"
+        "💬 Just talk to me, e.g.\n"
+        "   \"find the latest tech news and post the best one to the channel\"\n"
+        "   \"is this headline clickbait: ...\"\n\n"
+        "🤖 Every headline is checked by my fine-tuned clickbait model before publishing.\n\n"
+        "Or tap a category below:",
+        reply_markup=reply_markup,
+    )
 
 
 async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,9 +616,120 @@ async def wait_for_pages_live(url: str, timeout: int = 120, interval: int = 6) -
     return False
 
 
+def build_toolbox(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """The tools the LLM agent is allowed to call. Each returns a JSON-serialisable dict."""
+
+    async def search_news(category: str) -> dict:
+        news_category = NEWS_CATEGORY_MAP.get(category, category)
+        key = os.getenv('NEWS_API_KEY')
+        res = requests.get(
+            "https://newsapi.org/v2/top-headlines",
+            params={"category": news_category, "country": "us", "pageSize": 5, "apiKey": key},
+            timeout=10,
+        ).json()
+        articles = res.get('articles', [])
+        if not articles:
+            res2 = requests.get(
+                "https://newsapi.org/v2/everything",
+                params={"q": news_category, "language": "en", "sortBy": "publishedAt",
+                        "pageSize": 5, "apiKey": key},
+                timeout=10,
+            ).json()
+            articles = res2.get('articles', [])
+        if not articles:
+            return {"error": f"no news found for {category}"}
+
+        context.user_data['articles'] = articles
+        listed = []
+        for i, art in enumerate(articles, 1):
+            title = art.get('title', '')
+            verdict = await asyncio.to_thread(check_headline, title)
+            listed.append({
+                "number": i,
+                "headline": title,
+                "quality": verdict['label'],
+                "confidence": round(verdict['confidence'], 3),
+                "publishable": not verdict['is_clickbait'],
+            })
+        return {"headlines": listed}
+
+    async def check_headline_quality(headline: str) -> dict:
+        verdict = await asyncio.to_thread(check_headline, headline)
+        return {"label": verdict['label'],
+                "confidence": round(verdict['confidence'], 3),
+                "is_clickbait": verdict['is_clickbait']}
+
+    async def prepare_story(number: int) -> dict:
+        articles = context.user_data.get('articles', [])
+        idx = int(number) - 1
+        if not articles or idx < 0 or idx >= len(articles):
+            return {"error": "invalid number - call search_news first"}
+
+        art = articles[idx]
+        title = art.get('title', '')
+        verdict = await asyncio.to_thread(check_headline, title)
+        if verdict['is_clickbait']:
+            return {"blocked": True, "headline": title,
+                    "reason": "the clickbait classifier flagged this headline",
+                    "confidence": round(verdict['confidence'], 3)}
+
+        context.user_data['pending_title'] = title
+        context.user_data['pending_desc'] = art.get('description', '')
+        context.user_data['pending_source'] = art.get('source', {}).get('name', 'News')
+        context.user_data['pending_source_url'] = art.get('url')
+        context.user_data['pending_image_url'] = art.get('urlToImage')
+        context.user_data['pending_article'] = None
+        context.user_data['pending_article_url'] = None
+        context.user_data['pending_image_urls'] = None
+
+        data = await publish_curated_article(context)
+        if not data:
+            return {"error": "could not generate or publish the article"}
+        return {"prepared": True, "headline": data['headline'], "article_url": data['article_url']}
+
+    async def publish_story(platforms: str) -> dict:
+        if not context.user_data.get('pending_title'):
+            return {"error": "no story prepared yet - call prepare_story first"}
+        data = await publish_curated_article(context)
+        if not data:
+            return {"error": "the prepared story is no longer available"}
+
+        results = {"article_url": data['article_url']}
+        if platforms in ("channel", "both"):
+            results["telegram_channel"] = await _post_curated_to_channel(context, data) or "failed"
+        if platforms in ("instagram", "both"):
+            results["instagram"] = await asyncio.to_thread(_post_curated_to_instagram, data) or "failed"
+        return results
+
+    return {
+        "search_news": search_news,
+        "check_headline_quality": check_headline_quality,
+        "prepare_story": prepare_story,
+        "publish_story": publish_story,
+    }
+
+
+async def handle_agent_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Free-text message: hand it to the LLM agent, which decides which tools to call."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    history = context.user_data.get('chat_history', [])
+    try:
+        reply, history = await run_agent(client, text, history, build_toolbox(context))
+    except Exception as e:
+        logger.error(f"Agent failed: {e}")
+        await update.message.reply_text("Sorry, something went wrong on my side. Try again.")
+        return
+    context.user_data['chat_history'] = history
+    await update.message.reply_text(reply)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    # Anything that isn't a plain story number is a conversation with the agent.
     if not text.isdigit():
+        await handle_agent_chat(update, context, text)
         return
     idx = int(text) - 1
     articles = context.user_data.get('articles', [])
