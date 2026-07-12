@@ -116,28 +116,32 @@ FUNCTION_DECLARATIONS = [
 ]
 
 
-def _config():
+def _config(declarations: list):
     return types.GenerateContentConfig(
-        tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
+        tools=[types.Tool(function_declarations=declarations)],
         system_instruction=SYSTEM_PROMPT,
         # We run the tool loop ourselves so we can await async tools and log each step.
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
 
-async def run_agent(client, user_text: str, history: list, toolbox: dict) -> tuple[str, list]:
+async def run_agent(client, user_text: str, history: list, call_tool,
+                    declarations: list | None = None) -> tuple[str, list]:
     """Run one conversational turn.
 
-    Returns (reply_text, updated_history). `toolbox` maps a tool name to an async
-    callable that accepts keyword arguments and returns a JSON-serialisable dict.
+    `call_tool` is an async callable (name, args) -> dict. `declarations` are the tool
+    schemas shown to the LLM; when they come from the MCP server the bot does not need
+    to know its own tools in advance. Returns (reply_text, updated_history).
     """
+    declarations = declarations or FUNCTION_DECLARATIONS
     history = (history or [])[-MAX_HISTORY:]
     history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
 
     for step in range(MAX_STEPS):
         # The SDK call is blocking, so keep it off the bot's event loop.
         response = await asyncio.to_thread(
-            client.models.generate_content, model=MODEL, contents=history, config=_config()
+            client.models.generate_content, model=MODEL, contents=history,
+            config=_config(declarations)
         )
         candidate = response.candidates[0]
         parts = candidate.content.parts or []
@@ -155,15 +159,11 @@ async def run_agent(client, user_text: str, history: list, toolbox: dict) -> tup
             name = call.name
             args = dict(call.args or {})
             logger.info(f"[agent] step {step + 1}: calling {name}({args})")
-            tool = toolbox.get(name)
-            if tool is None:
-                result = {"error": f"unknown tool: {name}"}
-            else:
-                try:
-                    result = await tool(**args)
-                except Exception as e:
-                    logger.error(f"[agent] tool {name} failed: {e}")
-                    result = {"error": str(e)}
+            try:
+                result = await call_tool(name, args)
+            except Exception as e:
+                logger.error(f"[agent] tool {name} failed: {e}")
+                result = {"error": str(e)}
             history.append(types.Content(
                 role="user",
                 parts=[types.Part.from_function_response(name=name, response={"result": result})],

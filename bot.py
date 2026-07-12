@@ -20,6 +20,10 @@ from dotenv import load_dotenv
 
 from ml.classifier import check_headline  # fine-tuned DistilBERT clickbait detector
 from agent import run_agent               # conversational agent (LLM tool-calling loop)
+from mcp_client import MCPToolbox         # MCP client: tools are discovered, not hard-coded
+
+# Set at start-up once the MCP server is reachable; None means fall back to in-process tools.
+mcp_toolbox: MCPToolbox | None = None
 
 load_dotenv()
 
@@ -710,11 +714,30 @@ def build_toolbox(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 
 async def handle_agent_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Free-text message: hand it to the LLM agent, which decides which tools to call."""
+    """Free-text message: hand it to the LLM agent, which decides which tools to call.
+
+    Tools are served over MCP when the server is up; otherwise we fall back to calling
+    the same functions in-process so the bot keeps working either way.
+    """
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     history = context.user_data.get('chat_history', [])
+
+    if mcp_toolbox is not None and mcp_toolbox.session is not None:
+        call_tool = mcp_toolbox.call_tool
+        declarations = mcp_toolbox.declarations
+    else:
+        toolbox = build_toolbox(context)
+
+        async def call_tool(name: str, args: dict) -> dict:
+            fn = toolbox.get(name)
+            if fn is None:
+                return {"error": f"unknown tool: {name}"}
+            return await fn(**args)
+
+        declarations = None  # agent falls back to its built-in declarations
+
     try:
-        reply, history = await run_agent(client, text, history, build_toolbox(context))
+        reply, history = await run_agent(client, text, history, call_tool, declarations)
     except Exception as e:
         logger.error(f"Agent failed: {e}")
         await update.message.reply_text("Sorry, something went wrong on my side. Try again.")
@@ -1175,6 +1198,17 @@ async def run_with_retry(max_attempts: int = 10, base_delay: float = 5.0):
         try:
             await app.initialize()
             logger.info("✅ Connected to Telegram successfully.")
+
+            # Bring up the MCP server and discover its tools. If it fails, the agent
+            # still works using the same functions called in-process.
+            global mcp_toolbox
+            try:
+                mcp_toolbox = await MCPToolbox("mcp_server.py").connect()
+                logger.info("✅ MCP server connected; agent tools discovered over MCP.")
+            except Exception as mcp_err:
+                mcp_toolbox = None
+                logger.error(f"⚠️ MCP server unavailable ({mcp_err}); using in-process tools.")
+
             await app.start()
             await app.updater.start_polling(timeout=60, drop_pending_updates=True)
             await asyncio.Event().wait()

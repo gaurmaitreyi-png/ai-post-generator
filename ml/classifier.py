@@ -9,11 +9,19 @@ fast and only pays the load cost once. If the model has not been trained yet,
 check_headline() fails open (treats the headline as genuine) so the bot keeps working.
 """
 
+import contextlib
 import logging
 import os
+import sys
 import threading
 
 logger = logging.getLogger(__name__)
+
+# Loading a HuggingFace model prints progress bars to stdout. When this runs inside the
+# MCP server, stdout carries the JSON-RPC protocol, so any stray output corrupts it.
+# Keep stdout pristine: silence the progress bars and send anything else to stderr.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clickbait_model")
 LABELS = {0: "genuine", 1: "clickbait"}
@@ -36,12 +44,22 @@ def _load():
             logger.warning(f"Clickbait model not found at {MODEL_DIR}; run ml/train_clickbait.py")
             return False
         try:
-            import torch
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
-            _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-            _model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(_device)
-            _model.eval()
+            # Anything these libraries print must not land on stdout (see note above).
+            with contextlib.redirect_stdout(sys.stderr):
+                import torch
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+                from transformers.utils import logging as hf_logging
+                hf_logging.set_verbosity_error()
+                hf_logging.disable_progress_bar()
+
+                # Inference runs on CPU by default: scoring one headline takes ~20ms, and
+                # creating a CUDA context inside a spawned subprocess (e.g. the MCP server)
+                # is slow and can hang. The GPU is only needed for training.
+                use_cuda = os.getenv("CLICKBAIT_CUDA") == "1" and torch.cuda.is_available()
+                _device = torch.device("cuda" if use_cuda else "cpu")
+                _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+                _model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(_device)
+                _model.eval()
             logger.info(f"Clickbait classifier loaded on {_device}")
             return True
         except Exception as e:
