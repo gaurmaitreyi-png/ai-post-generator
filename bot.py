@@ -18,6 +18,8 @@ from telegram.request import HTTPXRequest
 from google import genai
 from dotenv import load_dotenv
 
+from ml.classifier import check_headline  # fine-tuned DistilBERT clickbait detector
+
 load_dotenv()
 
 # Windows consoles default to cp1252, which crashes on emoji in print()/logging output.
@@ -98,10 +100,22 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ No news found for {category} right now. Try another category.")
             return
         context.user_data['articles'] = articles
+
+        # Run every headline past the fine-tuned clickbait model (the editorial quality gate).
         news_list = f"📰 Top {category.capitalize()} News\n\n"
+        flagged = 0
         for idx, art in enumerate(articles):
-            news_list += f"{idx+1}. {art.get('title', 'No Title')}\n\n"
+            title = art.get('title', 'No Title')
+            verdict = await asyncio.to_thread(check_headline, title)
+            if verdict['is_clickbait']:
+                flagged += 1
+                news_list += f"{idx+1}. ⚠️ {title}\n   (clickbait — {verdict['confidence']*100:.0f}% — blocked)\n\n"
+            else:
+                news_list += f"{idx+1}. ✅ {title}\n\n"
+
         news_list += "👉 Type the number (1-5) of the news you want to turn into a post!"
+        if flagged:
+            news_list += f"\n\n🤖 My clickbait model flagged {flagged} of these — they can't be published."
         await query.edit_message_text(text=news_list)
     except Exception as e:
         logger.error(f"Error fetching news: {e}")
@@ -275,6 +289,38 @@ def post_to_instagram(caption: str, image_url: str | None) -> str | None:
         return perma.get("permalink", f"https://www.instagram.com (id {media_id})")
     except Exception as e:
         logger.error(f"Instagram post failed: {e}")
+        return None
+
+
+def post_to_facebook(caption: str, image_url: str | None) -> str | None:
+    page_id = os.getenv("FB_PAGE_ID")
+    token = os.getenv("FB_PAGE_ACCESS_TOKEN")
+    if not page_id or not token:
+        logger.error("Facebook FB_PAGE_ID / FB_PAGE_ACCESS_TOKEN not set.")
+        return None
+    base = "https://graph.facebook.com/v21.0"
+    try:
+        if image_url and image_url.startswith("http"):
+            # Photo post (Facebook accepts any aspect ratio and makes links in the caption clickable).
+            res = requests.post(
+                f"{base}/{page_id}/photos",
+                data={"url": image_url, "caption": caption[:2000], "access_token": token},
+                timeout=60,
+            ).json()
+            post_id = res.get("post_id") or res.get("id")
+        else:
+            res = requests.post(
+                f"{base}/{page_id}/feed",
+                data={"message": caption[:2000], "access_token": token},
+                timeout=60,
+            ).json()
+            post_id = res.get("id")
+        if post_id:
+            return f"https://www.facebook.com/{post_id}"
+        logger.error(f"Facebook post failed: {res}")
+        return None
+    except Exception as e:
+        logger.error(f"Facebook post failed: {e}")
         return None
 
 
@@ -572,10 +618,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     article = articles[idx]
-    await update.message.reply_text("🤖 Gemini is crafting your post...")
     title = article.get('title', 'Latest News')
     desc = article.get('description', '')
     source = article.get('source', {}).get('name', 'News')
+
+    # --- Editorial quality gate: the fine-tuned DistilBERT classifier decides ---
+    verdict = await asyncio.to_thread(check_headline, title)
+    if verdict['is_clickbait']:
+        await update.message.reply_text(
+            f"🚫 Blocked by the quality model.\n\n"
+            f"\"{title}\"\n\n"
+            f"Classified as CLICKBAIT ({verdict['confidence']*100:.1f}% confidence).\n"
+            f"Agentic News doesn't publish clickbait — please pick another story."
+        )
+        return
+
+    await update.message.reply_text(
+        f"✅ Quality check passed (genuine, {verdict['confidence']*100:.1f}% confidence).\n"
+        f"🤖 Gemini is crafting your post..."
+    )
 
     # --- Gemini: generate post (with retry) ---
     post_prompt = (
@@ -642,9 +703,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Ask for confirmation ---
     keyboard = read_more_row + [
-        [InlineKeyboardButton("📢📸 Post to Channel + Instagram", callback_data="both_yes")],
+        [InlineKeyboardButton("🚀 Post to All (Channel, Instagram, Facebook)", callback_data="both_yes")],
         [InlineKeyboardButton("📢 Post to Agentic News channel", callback_data="channel_yes")],
-        [InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes")],
+        [
+            InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes"),
+            InlineKeyboardButton("📘 Post to Facebook", callback_data="facebook_yes"),
+        ],
         [InlineKeyboardButton("❌ Skip", callback_data="skip")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -764,6 +828,13 @@ def _post_curated_to_instagram(data) -> str | None:
     return post_to_instagram(caption, img)
 
 
+def _post_curated_to_facebook(data) -> str | None:
+    img = data["image_urls"][0] if data["image_urls"] else None
+    # Facebook makes links in the caption clickable, so include the article link directly.
+    caption = f"📰 {data['headline']}\n\n{data['caption']}\n\n📖 Read the full story: {data['article_url']}"
+    return post_to_facebook(caption, img)
+
+
 async def handle_channel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -797,12 +868,35 @@ async def handle_both_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text("📸 Posting to Instagram...")
     insta_ok = _post_curated_to_instagram(data)
 
+    await query.edit_message_text("📘 Posting to Facebook...")
+    fb_ok = _post_curated_to_facebook(data)
+
     lines = [
         ("✅" if channel_ok else "❌") + " Telegram channel",
         ("✅" if insta_ok else "❌") + " Instagram",
+        ("✅" if fb_ok else "❌") + " Facebook",
         f"\n📄 Article: {data['article_url']}",
     ]
     await query.edit_message_text("Done posting:\n" + "\n".join(lines))
+
+
+async def handle_facebook_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📝 Preparing the Facebook post...")
+    data = await publish_curated_article(context)
+    if not data:
+        await query.edit_message_text("❌ Couldn't prepare the article (Gemini or GitHub issue). Try again.")
+        return
+    await query.edit_message_text("⏳ Posting to Facebook...")
+    post_url = _post_curated_to_facebook(data)
+    if post_url:
+        await query.edit_message_text(f"✅ Posted to Facebook!\n🔗 {post_url}\n📄 Article: {data['article_url']}")
+    else:
+        await query.edit_message_text(
+            "❌ Facebook post failed. Check FB_PAGE_ID / FB_PAGE_ACCESS_TOKEN in .env and that the "
+            "Page token is valid."
+        )
 
 
 async def handle_twitter_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -945,6 +1039,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_both_confirm, pattern="^both_"))
     app.add_handler(CallbackQueryHandler(handle_channel_confirm, pattern="^channel_"))
     app.add_handler(CallbackQueryHandler(handle_instagram_confirm, pattern="^instagram_"))
+    app.add_handler(CallbackQueryHandler(handle_facebook_confirm, pattern="^facebook_"))
     app.add_handler(CallbackQueryHandler(handle_skip, pattern="^skip$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

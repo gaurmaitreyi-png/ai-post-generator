@@ -1,0 +1,42 @@
+{
+  "test_metrics": {
+    "accuracy": 0.9903125,
+    "precision": 0.9875699192044748,
+    "recall": 0.993125,
+    "f1": 0.9903396696790278
+  },
+  "confusion_matrix": [
+    [
+      1580,
+      20
+    ],
+    [
+      11,
+      1589
+    ]
+  ],
+  "history": {
+    "train_loss": [
+      0.14480793956725393,
+      0.02286719344527228,
+      0.008455580154550262
+    ],
+    "val_accuracy": [
+      0.98375,
+      0.9859375,
+      0.9871875
+    ]
+  },
+  "config": {
+    "model": "distilbert-base-uncased",
+    "epochs": 3,
+    "batch_size": 64,
+    "lr": 2e-05,
+    "max_len": 48
+  },
+  "dataset": {
+    "train": 25600,
+    "val": 3200,
+    "test": 3200
+  }
+}

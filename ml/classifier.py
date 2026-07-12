@@ -1,0 +1,84 @@
+"""
+Inference wrapper around the fine-tuned DistilBERT clickbait classifier.
+
+The bot uses this as an editorial quality gate: headlines predicted as clickbait
+are blocked before anything is generated or published.
+
+The model is loaded lazily (on first use) and kept in memory, so the bot starts
+fast and only pays the load cost once. If the model has not been trained yet,
+check_headline() fails open (treats the headline as genuine) so the bot keeps working.
+"""
+
+import logging
+import os
+import threading
+
+logger = logging.getLogger(__name__)
+
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clickbait_model")
+LABELS = {0: "genuine", 1: "clickbait"}
+
+_model = None
+_tokenizer = None
+_device = None
+_lock = threading.Lock()
+
+
+def _load():
+    """Load the model once, on first use."""
+    global _model, _tokenizer, _device
+    if _model is not None:
+        return True
+    with _lock:
+        if _model is not None:
+            return True
+        if not os.path.isdir(MODEL_DIR):
+            logger.warning(f"Clickbait model not found at {MODEL_DIR}; run ml/train_clickbait.py")
+            return False
+        try:
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+            _model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(_device)
+            _model.eval()
+            logger.info(f"Clickbait classifier loaded on {_device}")
+            return True
+        except Exception as e:
+            logger.error(f"Could not load clickbait classifier: {e}")
+            return False
+
+
+def check_headline(headline: str) -> dict:
+    """Classify a headline.
+
+    Returns {"label": "genuine"|"clickbait", "confidence": float, "is_clickbait": bool}.
+    If the model is unavailable it fails open (label "genuine"), so publishing still works.
+    """
+    if not headline or not _load():
+        return {"label": "genuine", "confidence": 0.0, "is_clickbait": False, "model_available": False}
+
+    import torch
+    with torch.no_grad():
+        enc = _tokenizer(headline, truncation=True, padding="max_length",
+                         max_length=48, return_tensors="pt").to(_device)
+        probs = torch.softmax(_model(**enc).logits, dim=-1)[0]
+    idx = int(probs.argmax())
+    return {
+        "label": LABELS[idx],
+        "confidence": float(probs[idx]),
+        "is_clickbait": idx == 1,
+        "model_available": True,
+    }
+
+
+if __name__ == "__main__":
+    # Quick manual check.
+    for h in [
+        "Which TV Female Friend Group Do You Belong In",
+        "Bill Changing Credit Card Rules Is Sent to Obama With Gun Measure Included",
+        "You Won't Believe What Happened Next",
+        "ISRO successfully launches communication satellite into orbit",
+    ]:
+        r = check_headline(h)
+        print(f"[{r['label']:>9}] {r['confidence']:.3f}  {h}")

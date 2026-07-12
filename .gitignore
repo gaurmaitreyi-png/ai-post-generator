@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 venv/
 *.log
+
+# ML artifacts (regenerate with: python ml/train_clickbait.py)
+ml/clickbait_model/
+ml/data/
