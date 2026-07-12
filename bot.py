@@ -884,12 +884,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Ask for confirmation ---
     keyboard = read_more_row + [
-        [InlineKeyboardButton("🚀 Post to All (Channel, Instagram, Facebook)", callback_data="both_yes")],
+        [InlineKeyboardButton("📢📸 Post to Channel + Instagram", callback_data="both_yes")],
         [InlineKeyboardButton("📢 Post to Agentic News channel", callback_data="channel_yes")],
-        [
-            InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes"),
-            InlineKeyboardButton("📘 Post to Facebook", callback_data="facebook_yes"),
-        ],
+        [InlineKeyboardButton("📸 Post to Instagram", callback_data="instagram_yes")],
         [InlineKeyboardButton("❌ Skip", callback_data="skip")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1050,15 +1047,11 @@ async def handle_both_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text("📸 Posting to Instagram...")
     insta = _post_curated_to_instagram(data)
 
-    await query.edit_message_text("📘 Posting to Facebook...")
-    fb_ok = _post_curated_to_facebook(data)
-
     lines = [("✅" if channel_ok else "❌") + " Telegram channel"]
     if insta.get("url"):
         lines.append("✅ Instagram")
     else:
         lines.append(f"❌ Instagram — {insta.get('error', 'unknown reason')}")
-    lines.append(("✅" if fb_ok else "❌") + " Facebook")
     lines.append(f"\n📄 Article: {data['article_url']}")
     await query.edit_message_text("Done posting:\n" + "\n".join(lines))
 
@@ -1222,7 +1215,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(handle_both_confirm, pattern="^both_"))
     app.add_handler(CallbackQueryHandler(handle_channel_confirm, pattern="^channel_"))
     app.add_handler(CallbackQueryHandler(handle_instagram_confirm, pattern="^instagram_"))
-    app.add_handler(CallbackQueryHandler(handle_facebook_confirm, pattern="^facebook_"))
     app.add_handler(CallbackQueryHandler(handle_skip, pattern="^skip$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
