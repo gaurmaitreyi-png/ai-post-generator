@@ -54,11 +54,12 @@ async def _ensure_telegram():
 
 
 @mcp.tool()
-async def search_news(category: str) -> dict:
-    """Fetch the latest live news headlines for a category (technology, business, science,
-    entertainment, sports, general). Every headline is screened by the fine-tuned clickbait
-    classifier and returned with a quality verdict, a confidence score and a number."""
-    return await _tools["search_news"](category=category)
+async def search_news(category: str = "", query: str = "") -> dict:
+    """Fetch the latest live news headlines. Use 'category' for a broad section (technology,
+    business, science, entertainment, sports, general), or 'query' to search a specific topic,
+    person or keyword (e.g. 'trump', 'AI chips'). Provide exactly one of them. Every headline is
+    screened by the fine-tuned clickbait classifier and returned with a verdict and a number."""
+    return await _tools["search_news"](category=category, query=query)
 
 
 @mcp.tool()

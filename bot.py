@@ -623,25 +623,39 @@ async def wait_for_pages_live(url: str, timeout: int = 120, interval: int = 6) -
 def build_toolbox(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """The tools the LLM agent is allowed to call. Each returns a JSON-serialisable dict."""
 
-    async def search_news(category: str) -> dict:
-        news_category = NEWS_CATEGORY_MAP.get(category, category)
+    async def search_news(category: str = "", query: str = "") -> dict:
+        """Headlines by category, or by free-text topic (e.g. 'trump', 'AI chips')."""
         key = os.getenv('NEWS_API_KEY')
-        res = requests.get(
-            "https://newsapi.org/v2/top-headlines",
-            params={"category": news_category, "country": "us", "pageSize": 5, "apiKey": key},
-            timeout=10,
-        ).json()
-        articles = res.get('articles', [])
-        if not articles:
-            res2 = requests.get(
+        articles = []
+
+        if query:
+            # Topic search: anything that isn't one of the fixed categories.
+            res = requests.get(
                 "https://newsapi.org/v2/everything",
-                params={"q": news_category, "language": "en", "sortBy": "publishedAt",
+                params={"q": query, "language": "en", "sortBy": "publishedAt",
                         "pageSize": 5, "apiKey": key},
                 timeout=10,
             ).json()
-            articles = res2.get('articles', [])
+            articles = res.get('articles', [])
+        elif category:
+            news_category = NEWS_CATEGORY_MAP.get(category, category)
+            res = requests.get(
+                "https://newsapi.org/v2/top-headlines",
+                params={"category": news_category, "country": "us", "pageSize": 5, "apiKey": key},
+                timeout=10,
+            ).json()
+            articles = res.get('articles', [])
+            if not articles:
+                res2 = requests.get(
+                    "https://newsapi.org/v2/everything",
+                    params={"q": news_category, "language": "en", "sortBy": "publishedAt",
+                            "pageSize": 5, "apiKey": key},
+                    timeout=10,
+                ).json()
+                articles = res2.get('articles', [])
+
         if not articles:
-            return {"error": f"no news found for {category}"}
+            return {"error": f"no news found for {query or category or 'that'}"}
 
         context.user_data['articles'] = articles
         listed = []
@@ -740,7 +754,16 @@ async def handle_agent_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         reply, history = await run_agent(client, text, history, call_tool, declarations)
     except Exception as e:
         logger.error(f"Agent failed: {e}")
-        await update.message.reply_text("Sorry, something went wrong on my side. Try again.")
+        msg = str(e)
+        if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+            await update.message.reply_text(
+                "🚦 I've hit Google's Gemini free-tier limit for now (it allows only a small "
+                "number of requests per day, and each thing you ask me uses a few).\n\n"
+                "The quota resets daily. You can also generate a fresh Gemini API key at "
+                "https://aistudio.google.com/apikey and put it in .env as GEMINI_API_KEY."
+            )
+        else:
+            await update.message.reply_text("Sorry, something went wrong on my side. Try again.")
         return
     context.user_data['chat_history'] = history
     await update.message.reply_text(reply)

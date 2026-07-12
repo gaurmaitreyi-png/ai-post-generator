@@ -48,20 +48,24 @@ FUNCTION_DECLARATIONS = [
     {
         "name": "search_news",
         "description": (
-            "Fetch the latest live news headlines for a category. Each headline is "
-            "automatically checked by the clickbait classifier and returned with a "
-            "quality verdict and a number the user can refer to."
+            "Fetch the latest live news headlines. Use 'category' for a broad section, or "
+            "'query' to search a specific topic, person or keyword (e.g. 'trump', 'AI chips'). "
+            "Provide exactly one of them. Each headline is checked by the clickbait classifier "
+            "and returned with a quality verdict and a number the user can refer to."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "category": {
                     "type": "string",
-                    "description": "News category to search.",
+                    "description": "A broad news section. Use this OR query, not both.",
                     "enum": ["technology", "business", "science", "entertainment", "sports", "general"],
-                }
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Free-text topic/person/keyword to search for. Use this OR category.",
+                },
             },
-            "required": ["category"],
         },
     },
     {
