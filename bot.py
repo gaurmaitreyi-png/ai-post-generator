@@ -38,6 +38,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# The free-tier quota is counted per project per model, so switching model gives a fresh
+# daily allowance. Override with GEMINI_MODEL in .env.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 CATEGORIES = ['Tech', 'Business', 'Science', 'Entertainment', 'Sports']
 # Map our display names to NewsAPI's exact category slugs (NewsAPI uses "technology", not "tech").
 NEWS_CATEGORY_MAP = {'tech': 'technology'}
@@ -463,7 +466,7 @@ def generate_channel_article(title: str, desc: str, source: str) -> dict | None:
     )
     for attempt in range(3):
         try:
-            resp = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             raw = (resp.text or "").strip()
             raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
             data = json.loads(raw)
@@ -826,7 +829,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai_text = None
     for attempt in range(3):
         try:
-            response = client.models.generate_content(model='gemini-2.5-flash', contents=post_prompt)
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=post_prompt)
             ai_text = response.text
             break
         except Exception as e:

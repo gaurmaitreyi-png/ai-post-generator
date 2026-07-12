@@ -1,4 +1,4 @@
-"""
+﻿"""
 The conversational agent layer.
 
 Instead of driving the bot with buttons, the user talks to it in plain language
@@ -23,7 +23,14 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-2.5-flash"
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # this module can be imported before the bot loads its config
+
+# Free-tier quota is per project PER MODEL, so the model is configurable via .env.
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 MAX_STEPS = 6          # safety guard against a runaway tool-calling loop
 MAX_HISTORY = 20       # keep the last N turns of conversation
 
@@ -175,3 +182,4 @@ async def run_agent(client, user_text: str, history: list, call_tool,
 
     return ("That took too many steps, so I stopped. Try asking for one thing at a time.",
             history)
+
