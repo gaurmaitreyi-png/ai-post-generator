@@ -247,15 +247,23 @@ def post_to_reddit(title: str, text: str, image_bytes: io.BytesIO | None) -> str
         return None
 
 
-def post_to_instagram(caption: str, image_url: str | None) -> str | None:
+def _meta_error(payload: dict) -> str:
+    """Pull a human-readable reason out of a Meta Graph API error payload."""
+    err = (payload or {}).get("error", {})
+    msg = err.get("error_user_msg") or err.get("message") or "unknown error"
+    code = err.get("code")
+    return f"{msg} (Meta error code {code})" if code else msg
+
+
+def post_to_instagram(caption: str, image_url: str | None) -> dict:
+    """Post to Instagram. Returns {"url": permalink} on success, or {"error": reason}."""
     ig_user_id = os.getenv("IG_USER_ID")
     access_token = os.getenv("IG_ACCESS_TOKEN")
     if not ig_user_id or not access_token:
-        logger.error("Instagram IG_USER_ID / IG_ACCESS_TOKEN not set.")
-        return None
+        return {"error": "IG_USER_ID / IG_ACCESS_TOKEN are not set in .env"}
     if not image_url or not image_url.startswith("http"):
-        logger.error("Instagram requires a public image URL; none available for this article.")
-        return None
+        return {"error": "Instagram needs a public image URL, and none was available"}
+
     base = "https://graph.facebook.com/v21.0"
     try:
         # 1. Create a media container (Instagram fetches the image from image_url).
@@ -266,21 +274,22 @@ def post_to_instagram(caption: str, image_url: str | None) -> str | None:
         ).json()
         creation_id = create.get("id")
         if not creation_id:
+            reason = _meta_error(create)
             logger.error(f"Instagram container creation failed: {create}")
-            return None
+            return {"error": reason}
 
         # 2. Wait until the container finishes processing before publishing.
         for _ in range(10):
             status = requests.get(
                 f"{base}/{creation_id}",
-                params={"fields": "status_code", "access_token": access_token},
+                params={"fields": "status_code,status", "access_token": access_token},
                 timeout=30,
             ).json()
             if status.get("status_code") == "FINISHED":
                 break
             if status.get("status_code") == "ERROR":
                 logger.error(f"Instagram container processing error: {status}")
-                return None
+                return {"error": status.get("status") or "Instagram could not process the image"}
             time.sleep(2)
 
         # 3. Publish the container.
@@ -291,18 +300,19 @@ def post_to_instagram(caption: str, image_url: str | None) -> str | None:
         ).json()
         media_id = publish.get("id")
         if not media_id:
+            reason = _meta_error(publish)
             logger.error(f"Instagram publish failed: {publish}")
-            return None
+            return {"error": reason}
 
         perma = requests.get(
             f"{base}/{media_id}",
             params={"fields": "permalink", "access_token": access_token},
             timeout=30,
         ).json()
-        return perma.get("permalink", f"https://www.instagram.com (id {media_id})")
+        return {"url": perma.get("permalink", f"https://www.instagram.com (id {media_id})")}
     except Exception as e:
         logger.error(f"Instagram post failed: {e}")
-        return None
+        return {"error": str(e)}
 
 
 def post_to_facebook(caption: str, image_url: str | None) -> str | None:
@@ -714,9 +724,11 @@ def build_toolbox(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
         results = {"article_url": data['article_url']}
         if platforms in ("channel", "both"):
-            results["telegram_channel"] = await _post_curated_to_channel(context, data) or "failed"
+            posted = await _post_curated_to_channel(context, data)
+            results["telegram_channel"] = posted or {"error": "could not post to the Telegram channel"}
         if platforms in ("instagram", "both"):
-            results["instagram"] = await asyncio.to_thread(_post_curated_to_instagram, data) or "failed"
+            # This carries {"url": ...} or {"error": reason}, so the agent can explain failures.
+            results["instagram"] = await asyncio.to_thread(_post_curated_to_instagram, data)
         return results
 
     return {
@@ -986,7 +998,8 @@ async def _post_curated_to_channel(context, data) -> str | None:
     return await post_to_telegram_channel(context.bot, cap, image_bytes, reply_markup=read_more)
 
 
-def _post_curated_to_instagram(data) -> str | None:
+def _post_curated_to_instagram(data) -> dict:
+    """Returns {"url": ...} on success or {"error": reason} so callers can explain failures."""
     # Always use an Instagram-safe (valid aspect ratio) image so it never gets rejected.
     img = get_instagram_image_url(data["image_urls"], data["headline"])
     # Instagram captions can't have tappable links, so we point readers to the bio link (the index page).
@@ -1032,17 +1045,18 @@ async def handle_both_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     channel_ok = await _post_curated_to_channel(context, data)
 
     await query.edit_message_text("📸 Posting to Instagram...")
-    insta_ok = _post_curated_to_instagram(data)
+    insta = _post_curated_to_instagram(data)
 
     await query.edit_message_text("📘 Posting to Facebook...")
     fb_ok = _post_curated_to_facebook(data)
 
-    lines = [
-        ("✅" if channel_ok else "❌") + " Telegram channel",
-        ("✅" if insta_ok else "❌") + " Instagram",
-        ("✅" if fb_ok else "❌") + " Facebook",
-        f"\n📄 Article: {data['article_url']}",
-    ]
+    lines = [("✅" if channel_ok else "❌") + " Telegram channel"]
+    if insta.get("url"):
+        lines.append("✅ Instagram")
+    else:
+        lines.append(f"❌ Instagram — {insta.get('error', 'unknown reason')}")
+    lines.append(("✅" if fb_ok else "❌") + " Facebook")
+    lines.append(f"\n📄 Article: {data['article_url']}")
     await query.edit_message_text("Done posting:\n" + "\n".join(lines))
 
 
@@ -1132,16 +1146,16 @@ async def handle_instagram_confirm(update: Update, context: ContextTypes.DEFAULT
         return
 
     await query.edit_message_text("⏳ Posting to Instagram...")
-    post_url = _post_curated_to_instagram(data)
+    result = _post_curated_to_instagram(data)
 
-    if post_url:
+    if result.get("url"):
         await query.edit_message_text(
-            f"✅ Posted to Instagram!\n🔗 {post_url}\n📄 Article: {data['article_url']}"
+            f"✅ Posted to Instagram!\n🔗 {result['url']}\n📄 Article: {data['article_url']}"
         )
     else:
         await query.edit_message_text(
-            "❌ Instagram post failed. Check that IG_USER_ID and IG_ACCESS_TOKEN are set in .env, "
-            "your account is a Business account linked to a Facebook Page, and the token is valid."
+            f"❌ Instagram refused the post.\n\nReason: {result.get('error', 'unknown')}\n\n"
+            f"📄 The article page was still published: {data['article_url']}"
         )
 
 
